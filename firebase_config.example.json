@@ -1,0 +1,5 @@
+{
+  "api_key": "YOUR_FIREBASE_WEB_API_KEY",
+  "project_id": "YOUR_FIREBASE_PROJECT_ID",
+  "google_oauth_client_id": "YOUR_GOOGLE_DESKTOP_OAUTH_CLIENT_ID.apps.googleusercontent.com"
+}

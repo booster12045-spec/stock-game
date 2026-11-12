@@ -1,4 +1,15 @@
 import random
+import json
+import hashlib
+import base64
+import secrets
+import threading
+import urllib.parse
+import urllib.request
+import urllib.error
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 import sys
 import time
 from collections import deque
@@ -16,6 +27,158 @@ MUTED = (148, 163, 185)
 GREEN = (57, 203, 142)
 RED = (245, 103, 117)
 BLUE = (92, 151, 255)
+GOLD = (255, 205, 92)
+
+CONFIG_PATH = Path(__file__).with_name("firebase_config.json")
+
+
+class FirebaseService:
+    """Google OAuth and Firebase Auth/Firestore REST client."""
+    def __init__(self):
+        if not CONFIG_PATH.exists():
+            raise RuntimeError("firebase_config.json 설정 파일이 없습니다. FIREBASE_SETUP.md 안내를 따라 설정해 주세요.")
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        self.api_key = config.get("api_key", "").strip()
+        self.project_id = config.get("project_id", "").strip()
+        self.client_id = config.get("google_oauth_client_id", "").strip()
+        if not all((self.api_key, self.project_id, self.client_id)):
+            raise RuntimeError("firebase_config.json에 api_key, project_id, google_oauth_client_id를 입력해 주세요.")
+        self.id_token = None
+        self.refresh_token = None
+        self.token_expires_at = 0
+        self.uid = None
+        self.email = None
+
+    def _json_request(self, url, data=None, method=None, headers=None):
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = json.loads(detail).get("error", {}).get("message", detail)
+            except (ValueError, AttributeError):
+                pass
+            raise RuntimeError(f"Firebase 요청 실패: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"인터넷 연결을 확인해 주세요: {exc.reason}") from exc
+
+    def google_sign_in(self):
+        state = secrets.token_urlsafe(24)
+        verifier = secrets.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+        callback = {}
+        ready = threading.Event()
+
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(handler):
+                parsed = urllib.parse.urlparse(handler.path)
+                params = urllib.parse.parse_qs(parsed.query)
+                callback.update({key: values[0] for key, values in params.items()})
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/html; charset=utf-8")
+                handler.end_headers()
+                handler.wfile.write("<meta charset='utf-8'><h2>로그인 완료</h2><p>이 창을 닫고 주식 게임으로 돌아가세요.</p>".encode())
+                ready.set()
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), CallbackHandler)
+        server.timeout = 1
+        redirect_uri = f"http://127.0.0.1:{server.server_port}/"
+        params = {
+            "client_id": self.client_id, "redirect_uri": redirect_uri,
+            "response_type": "code", "scope": "openid email profile",
+            "state": state, "code_challenge": challenge,
+            "code_challenge_method": "S256", "prompt": "select_account",
+        }
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+        webbrowser.open(auth_url)
+        try:
+            while not ready.is_set():
+                server.handle_request()
+        finally:
+            server.server_close()
+        if callback.get("state") != state or "code" not in callback:
+            raise RuntimeError("Google 로그인이 취소되었거나 확인에 실패했습니다.")
+        token = self._json_request("https://oauth2.googleapis.com/token", {
+            "client_id": self.client_id, "code": callback["code"],
+            "code_verifier": verifier, "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        })
+        # Firebase accepts a Google OAuth access token here; using it avoids
+        # requiring the desktop OAuth client's ID-token audience to match the
+        # web client ID configured by Firebase Authentication.
+        idp = urllib.parse.urlencode({"access_token": token["access_token"], "providerId": "google.com"})
+        result = self._json_request(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={self.api_key}",
+            {"postBody": idp, "requestUri": redirect_uri, "returnIdpCredential": True, "returnSecureToken": True},
+        )
+        self.id_token = result["idToken"]
+        self.refresh_token = result["refreshToken"]
+        self.token_expires_at = time.monotonic() + int(result.get("expiresIn", "3600"))
+        self.uid = result["localId"]
+        self.email = result.get("email", "")
+
+    def _auth(self):
+        if self.token_expires_at and time.monotonic() >= self.token_expires_at - 60:
+            token = self._json_request(f"https://securetoken.googleapis.com/v1/token?key={self.api_key}", {
+                "grant_type": "refresh_token", "refresh_token": self.refresh_token,
+            }, method="POST")
+            self.id_token = token["id_token"]
+            self.refresh_token = token.get("refresh_token", self.refresh_token)
+            self.token_expires_at = time.monotonic() + int(token.get("expires_in", "3600"))
+        return {"Authorization": f"Bearer {self.id_token}"}
+
+    def _document_url(self, collection, document_id):
+        return f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents/{collection}/{urllib.parse.quote(document_id, safe='')}"
+
+    def get_profile(self):
+        try:
+            doc = self._json_request(self._document_url("players", self.uid), headers=self._auth())
+            return doc.get("fields", {}).get("nickname", {}).get("stringValue")
+        except RuntimeError as exc:
+            if "NOT_FOUND" in str(exc):
+                return None
+            raise
+
+    def set_nickname(self, nickname):
+        fields = {"nickname": {"stringValue": nickname}, "email": {"stringValue": self.email or ""}}
+        self._json_request(self._document_url("players", self.uid), {"fields": fields}, method="PATCH", headers=self._auth())
+
+    def get_leaderboard(self):
+        url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents:runQuery"
+        query = {"structuredQuery": {
+            "from": [{"collectionId": "rankings"}],
+            "orderBy": [{"field": {"fieldPath": "score"}, "direction": "DESCENDING"}],
+            "limit": 20,
+        }}
+        rows = self._json_request(url, query, method="POST", headers=self._auth())
+        results = []
+        for row in rows:
+            doc = row.get("document")
+            if not doc:
+                continue
+            fields = doc.get("fields", {})
+            results.append({
+                "nickname": fields.get("nickname", {}).get("stringValue", "익명"),
+                "score": int(fields.get("score", {}).get("integerValue", "0")),
+                "updated_at": fields.get("updatedAt", {}).get("timestampValue", ""),
+                "uid": doc["name"].rsplit("/", 1)[-1],
+            })
+        return results
+
+    def save_score(self, nickname, score):
+        fields = {
+            "nickname": {"stringValue": nickname},
+            "score": {"integerValue": str(int(score))},
+            "updatedAt": {"timestampValue": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        }
+        self._json_request(self._document_url("rankings", self.uid), {"fields": fields}, method="PATCH", headers=self._auth())
 
 NAMES = ["삼성전자", "애플", "테슬라", "아마존", "로블록스", "SK하이닉스", "대한항공", "코스트코", "코카콜라", "한국전력"]
 PRICES = [270500, 445969, 668437, 395650, 64184, 1819000, 26050, 1571201, 121058, 38750]
@@ -91,6 +254,96 @@ class StockGame:
         self.plus_rect = pygame.Rect(1200, 535, 48, 48)
         self.qty_rect = pygame.Rect(954, 535, 236, 48)
         self.rows_rect = pygame.Rect(32, 166, 330, 556)
+        self.firebase = None
+        self.nickname = ""
+        self.view = "login"
+        self.auth_error = ""
+        self.nickname_input = ""
+        self.confirm_action = None
+        self.leaderboard = []
+        self.leaderboard_error = ""
+        self.login_rect = pygame.Rect(475, 490, 370, 62)
+        self.nickname_rect = pygame.Rect(475, 470, 370, 56)
+        self.nickname_submit_rect = pygame.Rect(475, 550, 370, 58)
+        self.ranking_tab_rect = pygame.Rect(730, 38, 150, 42)
+        self.enroll_rect = pygame.Rect(1076, 116, 172, 42)
+        self.confirm_save_rect = pygame.Rect(600, 510, 190, 54)
+        self.confirm_cancel_rect = pygame.Rect(810, 510, 190, 54)
+        self.best_score = self.cash
+        self.best_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def reset_game(self):
+        PRICES[:] = [270500, 445969, 668437, 395650, 64184, 1819000, 26050, 1571201, 121058, 38750]
+        self.cash = 5_000_000
+        self.holdings = [0] * len(NAMES)
+        self.cost_basis = [0.0] * len(NAMES)
+        self.realized_profit = [0.0] * len(NAMES)
+        self.history = [[float(price)] for price in PRICES]
+        self.trend_direction = [0] * len(NAMES)
+        self.trend_remaining = [0] * len(NAMES)
+        self.trend_duration = [0] * len(NAMES)
+        self.trend_strength = [0.0] * len(NAMES)
+        self.bubble_remaining = [0] * len(NAMES)
+        self.news = [deque(maxlen=5) for _ in NAMES]
+        self.latest_news_type = [None] * len(NAMES)
+        self.add_news(0, True, "갤럭시 신제품 공개 기대감에 관심 집중")
+        self.add_news(5, True, "AI 메모리 수요 확대 전망")
+        self.add_news(2, False, "전기차 가격 경쟁 심화 우려")
+        self.selected = 0
+        self.quantity = "1"
+        self.best_score = self.cash
+        self.best_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.last_update = time.monotonic()
+        self.view = "game"
+        self.set_message("새 게임을 시작했습니다.", GREEN)
+
+    def begin_google_login(self):
+        try:
+            self.firebase = FirebaseService()
+            self.firebase.google_sign_in()
+            nickname = self.firebase.get_profile()
+            if nickname:
+                self.nickname = nickname
+                self.view = "game"
+                self.set_message(f"{nickname}님, 로그인했습니다.", GREEN)
+            else:
+                self.view = "nickname"
+        except Exception as exc:
+            self.auth_error = str(exc)
+
+    def submit_nickname(self):
+        nickname = self.nickname_input.strip()
+        if not 2 <= len(nickname) <= 12:
+            self.auth_error = "닉네임은 2~12자로 입력해 주세요."
+            return
+        try:
+            self.firebase.set_nickname(nickname)
+            self.nickname = nickname
+            self.auth_error = ""
+            self.view = "game"
+            self.set_message(f"{nickname}님, 게임을 시작합니다.", GREEN)
+        except Exception as exc:
+            self.auth_error = str(exc)
+
+    def refresh_leaderboard(self):
+        try:
+            self.leaderboard = self.firebase.get_leaderboard()
+            self.leaderboard_error = ""
+        except Exception as exc:
+            self.leaderboard_error = str(exc)
+
+    def enroll_score(self):
+        try:
+            self.firebase.save_score(self.nickname, self.best_score)
+            self.reset_game()
+        except Exception as exc:
+            self.view = "game"
+            self.set_message(str(exc), RED)
+
+    def update_best_score(self):
+        if self.cash > self.best_score:
+            self.best_score = self.cash
+            self.best_time = time.strftime("%Y-%m-%d %H:%M:%S")
 
     def price(self, i):
         return PRICES[i]
@@ -258,9 +511,69 @@ class StockGame:
     def draw_header(self):
         self.draw_text("주식 투자 게임", (32, 25), self.title)
         self.draw_text("실시간으로 변하는 가상 시장에서 투자해 보세요", (34, 67), self.small, MUTED)
+        self.draw_text_fit(f"로그인: {self.nickname}", (420, 43), self.small, 280, MUTED)
+        self.draw_button(self.ranking_tab_rect, "랭킹", BLUE)
         pygame.draw.rect(self.screen, PANEL, (902, 25, 346, 74), border_radius=12)
         self.draw_text("총 자산", (922, 37), self.small, MUTED)
         self.draw_text_fit(won(self.total_assets()), (922, 59), self.medium, 306)
+
+    def draw_login(self):
+        self.screen.fill(BG)
+        pygame.draw.rect(self.screen, PANEL, (435, 235, 450, 390), border_radius=18)
+        self.draw_text("주식 투자 게임", (475, 280), self.title)
+        self.draw_text("Google 계정으로 로그인하고 최고 기록을 저장하세요.", (475, 345), self.small, MUTED)
+        self.draw_button(self.login_rect, "Google 계정으로 로그인", BLUE)
+        if self.auth_error:
+            self.draw_text_fit(self.auth_error, (475, 575), self.small, 370, RED)
+
+    def draw_nickname(self):
+        self.screen.fill(BG)
+        pygame.draw.rect(self.screen, PANEL, (435, 245, 450, 390), border_radius=18)
+        self.draw_text("닉네임 설정", (475, 285), self.title)
+        self.draw_text("랭킹에 표시할 닉네임을 정해 주세요. (2~12자)", (475, 345), self.small, MUTED)
+        pygame.draw.rect(self.screen, (19, 27, 41), self.nickname_rect, border_radius=8)
+        val = self.nickname_input + ("|" if pygame.time.get_ticks() % 1000 < 500 else "")
+        image = self.f.render(val or "닉네임 입력", True, WHITE if val else MUTED)
+        self.screen.blit(image, image.get_rect(center=self.nickname_rect.center))
+        self.draw_button(self.nickname_submit_rect, "게임 시작", BLUE)
+        if self.auth_error:
+            self.draw_text_fit(self.auth_error, (475, 620), self.small, 370, RED)
+
+    def draw_ranking(self):
+        self.screen.fill(BG)
+        self.draw_text("주식 투자 게임", (32, 25), self.title)
+        self.draw_text_fit(f"랭킹 · {self.nickname}님", (32, 67), self.small, 900, MUTED)
+        pygame.draw.rect(self.screen, PANEL, (200, 125, 920, 730), border_radius=16)
+        self.draw_text("보유 현금 최고 기록 랭킹", (240, 155), self.title)
+        self.draw_text("순위", (250, 220), self.small, MUTED)
+        self.draw_text("닉네임", (340, 220), self.small, MUTED)
+        self.draw_text("점수 (보유 현금)", (710, 220), self.small, MUTED)
+        self.draw_text("기록 시각", (960, 220), self.small, MUTED)
+        if self.leaderboard_error:
+            self.draw_text_fit(self.leaderboard_error, (250, 270), self.small, 820, RED)
+        elif not self.leaderboard:
+            self.draw_text("아직 등록된 기록이 없습니다.", (250, 270), self.f, MUTED)
+        for i, row in enumerate(self.leaderboard[:20]):
+            y = 255 + i * 27
+            if row["uid"] == self.firebase.uid:
+                pygame.draw.rect(self.screen, (42, 59, 86), (235, y - 4, 850, 26), border_radius=5)
+            self.draw_text(f"{i + 1:>2}위", (250, y), self.small, GOLD if i < 3 else WHITE)
+            self.draw_text_fit(row["nickname"], (340, y), self.small, 300)
+            self.draw_text_fit(won(row["score"]), (710, y), self.small, 210)
+            stamp = row["updated_at"].replace("T", " ").replace("Z", " UTC")
+            self.draw_text_fit(stamp, (960, y), self.small, 130, MUTED)
+        self.draw_button(pygame.Rect(32, 116, 155, 48), "게임으로", PANEL2)
+
+    def draw_confirm(self):
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 175))
+        self.screen.blit(overlay, (0, 0))
+        pygame.draw.rect(self.screen, PANEL, (480, 350, 560, 250), border_radius=16)
+        self.draw_text("랭킹에 기록할까요?", (520, 385), self.title)
+        self.draw_text("저장하면 현재 게임이 초기화되고 새 게임이 시작됩니다.", (520, 445), self.small, MUTED)
+        self.draw_text_fit(f"저장 점수: {won(self.best_score)}", (520, 475), self.small, 480, GOLD)
+        self.draw_button(self.confirm_save_rect, "저장 후 새 게임", BLUE)
+        self.draw_button(self.confirm_cancel_rect, "취소", PANEL2)
 
     def draw_stocks(self):
         self.panel(pygame.Rect(32, 116, 330, 606), "종목 목록", "종목을 클릭하면 그래프가 바뀝니다")
@@ -335,6 +648,8 @@ class StockGame:
     def draw_portfolio_trade(self):
         rect = pygame.Rect(902, 116, 346, 606)
         self.panel(rect, "내 자산", "현금과 보유 주식 평가액")
+        self.draw_text_fit(f"최고 기록: {won(self.best_score)} · {self.best_time}", (rect.x + 20, rect.y + 75), self.small, 320, GOLD)
+        self.draw_button(self.enroll_rect, "랭킹 등재", (120, 103, 54))
         self.draw_text("보유 현금", (rect.x + 22, rect.y + 91), self.small, MUTED)
         self.draw_text_fit(won(self.cash), (rect.x + 22, rect.y + 116), self.medium, rect.w - 44)
         i = self.selected
@@ -381,17 +696,51 @@ class StockGame:
 
     def draw(self):
         self.screen.fill(BG)
-        self.draw_header()
-        self.draw_stocks()
-        self.draw_chart()
-        self.draw_portfolio_trade()
-        self.draw_news()
+        if self.view == "login":
+            self.draw_login()
+        elif self.view == "nickname":
+            self.draw_nickname()
+        elif self.view == "ranking":
+            self.draw_ranking()
+        else:
+            self.draw_header()
+            self.draw_stocks()
+            self.draw_chart()
+            self.draw_portfolio_trade()
+            self.draw_news()
+            if self.view == "confirm":
+                self.draw_confirm()
         scaled = pygame.transform.smoothscale(self.screen, self.window.get_size())
         self.window.blit(scaled, (0, 0))
         pygame.display.flip()
 
     def handle_click(self, pos):
         pos = (int(pos[0]), int(pos[1]))
+        if self.view == "login":
+            if self.login_rect.collidepoint(pos):
+                self.begin_google_login()
+            return
+        if self.view == "nickname":
+            if self.nickname_submit_rect.collidepoint(pos):
+                self.submit_nickname()
+            return
+        if self.view == "confirm":
+            if self.confirm_save_rect.collidepoint(pos):
+                self.enroll_score()
+            elif self.confirm_cancel_rect.collidepoint(pos):
+                self.view = "game"
+            return
+        if self.view == "ranking":
+            if pygame.Rect(32, 116, 155, 48).collidepoint(pos):
+                self.view = "game"
+            return
+        if self.ranking_tab_rect.collidepoint(pos):
+            self.view = "ranking"
+            self.refresh_leaderboard()
+            return
+        if self.enroll_rect.collidepoint(pos):
+            self.view = "confirm"
+            return
         if self.rows_rect.collidepoint(pos):
             row = (pos[1] - 216) // 48
             if 0 <= row < 10:
@@ -414,9 +763,11 @@ class StockGame:
         running = True
         while running:
             now = time.monotonic()
-            if now - self.last_update >= 1:
+            if self.view in ("game", "confirm") and now - self.last_update >= 1:
                 self.tick_market()
                 self.last_update = now
+            if self.view in ("game", "confirm"):
+                self.update_best_score()
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -426,8 +777,17 @@ class StockGame:
                         logical_pos = (round(event.pos[0] * WIDTH / window_w), round(event.pos[1] * HEIGHT / window_h))
                         self.handle_click(logical_pos)
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
+                    if event.key == pygame.K_ESCAPE and self.view == "confirm":
+                        self.view = "game"
+                    elif event.key == pygame.K_ESCAPE:
                         running = False
+                    elif self.view == "nickname":
+                        if event.key == pygame.K_BACKSPACE:
+                            self.nickname_input = self.nickname_input[:-1]
+                        elif event.key == pygame.K_RETURN:
+                            self.submit_nickname()
+                        elif event.unicode.isprintable() and len(self.nickname_input) < 12:
+                            self.nickname_input += event.unicode
                     elif self.input_active:
                         if event.key == pygame.K_BACKSPACE:
                             self.quantity = self.quantity[:-1]

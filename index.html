@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1020">
+  <title>주식 투자 게임</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#game" aria-label="주식 투자 게임 홈">
+        <span class="brand-mark">₩</span>
+        <span><strong>주식 투자 게임</strong><small>가상 시장에 투자해 보세요</small></span>
+      </a>
+      <div class="top-actions">
+        <span id="userBadge" class="user-badge hidden"></span>
+        <button id="rankingTab" class="button button-quiet hidden">랭킹</button>
+        <button id="signOutButton" class="button button-quiet hidden">로그아웃</button>
+        <button id="signInButton" class="button button-primary hidden">Google 계정으로 로그인</button>
+      </div>
+    </header>
+
+    <section id="authView" class="auth-view hidden">
+      <div class="auth-card">
+        <div class="auth-icon">↗</div>
+        <p class="eyebrow">VIRTUAL MARKET</p>
+        <h1>나만의 투자 기록을<br>만들어 보세요</h1>
+        <p class="muted">Google 계정으로 로그인하면 게임을 시작하고 최고 기록을 랭킹에 등록할 수 있어요.</p>
+        <button id="heroSignInButton" class="button button-primary button-wide">Google 계정으로 로그인</button>
+        <p id="authError" class="error-text" role="alert"></p>
+      </div>
+    </section>
+
+    <section id="gameView" class="view hidden">
+      <div class="summary-strip">
+        <div><span class="label">총 자산</span><strong id="totalAssets">₩5,000,000</strong></div>
+        <div class="best-summary"><span class="label">내 최고 현금 기록</span><strong id="bestScore">₩5,000,000</strong><small id="bestTime"></small></div>
+      </div>
+      <div class="game-grid">
+        <section class="card stocks-card">
+          <div class="card-heading"><div><h2>종목 목록</h2><p>종목을 선택해 시세를 확인하세요</p></div></div>
+          <div class="stock-head"><span>종목</span><span>현재가</span><span>뉴스</span><span>보유</span></div>
+          <div id="stockList" class="stock-list"></div>
+        </section>
+
+        <section class="card chart-card">
+          <div class="card-heading"><div><h2>주가 그래프</h2><p>가상 시세 · 1초마다 업데이트</p></div><span class="live-dot">실시간</span></div>
+          <div class="quote"><span id="selectedName"></span><strong id="selectedPrice"></strong><small id="priceChange"></small></div>
+          <div class="chart-wrap"><canvas id="priceChart" aria-label="선택한 종목의 최근 시세 그래프"></canvas></div>
+          <div class="chart-axis"><span>이전</span><span>현재</span></div>
+          <section class="news-block"><div class="news-title"><h3 id="newsTitle">시장 뉴스</h3><span>실제 기업 뉴스가 아닌 게임 내 가상 뉴스</span></div><div id="newsList" class="news-list"></div></section>
+        </section>
+
+        <section class="card portfolio-card">
+          <div class="card-heading"><div><h2>내 자산</h2><p>현금과 보유 주식 평가액</p></div></div>
+          <div class="cash-box"><span class="label">보유 현금</span><strong id="cashBalance"></strong></div>
+          <div class="position-title"><strong id="positionName"></strong><span id="positionShares"></span></div>
+          <div class="metrics-grid">
+            <div><span class="label">평가 금액</span><strong id="positionValue"></strong></div>
+            <div><span class="label">평가손익</span><strong id="unrealizedProfit"></strong><small id="unrealizedPercent"></small></div>
+            <div class="full-row"><span class="label">실현손익</span><strong id="realizedProfit"></strong></div>
+          </div>
+          <div class="trade-controls">
+            <label class="label" for="quantityInput">주문 수량</label>
+            <div class="quantity-row"><button id="minusButton" class="stepper" aria-label="수량 감소">−</button><input id="quantityInput" type="number" min="1" max="9999" value="1" inputmode="numeric"><button id="plusButton" class="stepper" aria-label="수량 증가">+</button></div>
+            <small class="muted">수량은 매수·매도에 공통 적용</small>
+            <div class="trade-buttons"><button id="buyButton" class="button button-buy">매수</button><button id="sellButton" class="button button-sell">매도</button></div>
+          </div>
+          <div class="record-box"><div><span class="label">최고 기록 시각</span><small id="recordTime"></small></div><button id="enrollButton" class="button button-gold">랭킹 등재</button></div>
+          <p id="gameMessage" class="message" role="status"></p>
+        </section>
+      </div>
+    </section>
+
+    <section id="rankingView" class="view hidden">
+      <div class="ranking-heading"><div><p class="eyebrow">LEADERBOARD</p><h1>보유 현금 최고 기록</h1><p class="muted">계정별로 가장 최근에 등재한 기록을 보여줍니다.</p></div><button id="backToGameButton" class="button button-quiet">게임으로 돌아가기</button></div>
+      <div class="card ranking-card"><div id="rankingStatus" class="ranking-status"></div><div class="table-scroll"><table><thead><tr><th>순위</th><th>닉네임</th><th>점수 · 보유 현금</th><th>기록 시각</th></tr></thead><tbody id="rankingRows"></tbody></table></div></div>
+    </section>
+
+    <footer class="footer"><span>주식 투자 게임 · 가상 시장</span><span>게임 데이터는 브라우저에서 새 게임을 시작할 때 초기화됩니다.</span></footer>
+  </main>
+
+  <dialog id="nicknameDialog" class="modal">
+    <form id="nicknameForm" method="dialog" class="modal-card">
+      <p class="eyebrow">WELCOME</p><h2>닉네임을 정해 주세요</h2><p class="muted">랭킹에 표시할 이름입니다. 2~12자로 입력하세요.</p>
+      <label class="label" for="nicknameInput">닉네임</label><input id="nicknameInput" class="text-input" minlength="2" maxlength="12" autocomplete="nickname" required>
+      <p id="nicknameError" class="error-text" role="alert"></p><button class="button button-primary button-wide" type="submit">저장하고 시작</button>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog" class="modal">
+    <div class="modal-card"><p class="eyebrow">SAVE RECORD</p><h2>랭킹에 기록할까요?</h2><p class="muted">저장하면 현재 게임이 초기화되고 새 게임이 시작됩니다.</p><div class="confirm-score"><span class="label">저장 점수 · 보유 현금 최고 기록</span><strong id="confirmScore"></strong></div><p id="saveError" class="error-text" role="alert"></p><div class="modal-actions"><button id="cancelSaveButton" class="button button-quiet">취소</button><button id="confirmSaveButton" class="button button-primary">저장 후 새 게임</button></div></div>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
