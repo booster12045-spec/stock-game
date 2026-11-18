@@ -1,8 +1,19 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function validTitle() {
+      return !request.resource.data.keys().hasAny(['title'])
+        || request.resource.data.title == ''
+        || (request.resource.data.title == '개발자'
+          && request.auth.token.email == 'booster12045@gmail.com');
+    }
+
     match /players/{uid} {
-      allow read, write: if request.auth != null && request.auth.uid == uid;
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null
+        && request.auth.uid == uid
+        && validTitle();
+      allow delete: if request.auth != null && request.auth.uid == uid;
     }
 
     match /rankings/{uid} {
@@ -15,7 +26,8 @@ service cloud.firestore {
         && request.resource.data.nickname.size() <= 12
         && request.resource.data.score is int
         && request.resource.data.score >= 0
-        && request.resource.data.updatedAt is timestamp;
+        && request.resource.data.updatedAt is timestamp
+        && validTitle();
       allow delete: if false;
     }
   }

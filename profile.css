@@ -1,0 +1,15 @@
+.profile-card{max-width:720px;padding:24px}
+.profile-form{display:grid;gap:20px}
+.profile-email{margin:7px 0 0;color:var(--text);font-size:14px}
+.profile-title-section{display:grid;gap:15px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#0d1727}
+.profile-title-section .muted{margin:0;line-height:1.7}
+.developer-title-control{max-width:320px}
+.title-badges{display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px;vertical-align:middle}
+.profile-title-section .title-badges{margin-top:8px}
+.title-badge{display:inline-flex;align-items:center;padding:4px 8px;border-radius:99px;font-size:10px;font-weight:800;line-height:1.3;white-space:nowrap}
+.title-badge-developer{border:1px solid #8b6d32;background:#5b4925;color:#ffe4a8}
+.title-badge-king{border:1px solid #287e68;background:#153f37;color:#8ff0d0}
+.profile-no-title{color:var(--muted);font-size:12px}
+.ranking-title-badges{margin-left:8px}
+.profile-save-button{justify-self:start;min-width:160px}
+@media(max-width:720px){.profile-card{padding:16px}.profile-save-button{width:100%}.ranking-title-badges{margin-left:5px}}

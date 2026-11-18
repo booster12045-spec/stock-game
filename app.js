@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-app.js";
 import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-auth.js";
-import { getFirestore, collection, doc, getDoc, getDocs, limit, orderBy, query, serverTimestamp, setDoc } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-firestore.js";
+import { getFirestore, collection, doc, getDoc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc, writeBatch } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-firestore.js";
 import { firebaseConfig } from "./firebase_config.js";
 
 const $ = (selector) => document.querySelector(selector);
@@ -26,18 +26,52 @@ const game = {
   prices: [...initialPrices], history: initialPrices.map((n) => [n]), selected: 0,
   trendDirection: Array(10).fill(0), trendRemaining: Array(10).fill(0), trendDuration: Array(10).fill(0), trendStrength: Array(10).fill(0),
   bubbleRemaining: Array(10).fill(0), latestNewsType: Array(10).fill("-"), news: Array.from({length:10}, () => []),
-  bestScore: 5000000, bestTime: new Date(), currentUser: null, nickname: "", timer: null, messageTimer: null
+  bestScore: 5000000, bestTime: new Date(), currentUser: null, nickname: "", title: "", isCurrentLeader: false, timer: null, messageTimer: null
 };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const configReady = !Object.values(firebaseConfig).some((value) => !value || String(value).includes("YOUR_"));
+const developerEmail = "booster12045@gmail.com";
+let rankingUnsubscribe = null;
+let profileLeaderUnsubscribe = null;
 
 function showView(view) {
-  ["authView", "gameView", "rankingView"].forEach((id) => $(`#${id}`).classList.toggle("hidden", id !== view));
+  ["authView", "gameView", "rankingView", "profileView"].forEach((id) => $(`#${id}`).classList.toggle("hidden", id !== view));
+  if (view !== "rankingView" && rankingUnsubscribe) { rankingUnsubscribe(); rankingUnsubscribe = null; }
+  if (view !== "profileView" && profileLeaderUnsubscribe) { profileLeaderUnsubscribe(); profileLeaderUnsubscribe = null; }
   if (game.timer) clearInterval(game.timer);
   game.timer = view === "gameView" ? setInterval(tickMarket, 1000) : null;
+}
+
+function isDeveloperAccount() {
+  return game.currentUser?.email?.toLowerCase() === developerEmail;
+}
+
+function addTitleBadge(container, title) {
+  const badge = document.createElement("span");
+  badge.className = `title-badge ${title === "개발자" ? "title-badge-developer" : "title-badge-king"}`;
+  badge.textContent = title;
+  container.append(badge);
+}
+
+function renderProfileTitles() {
+  const badges = $("#profileTitleBadges");
+  badges.replaceChildren();
+  if (isDeveloperAccount() && game.title === "개발자") addTitleBadge(badges, "개발자");
+  if (game.isCurrentLeader) addTitleBadge(badges, "익절왕");
+  if (!badges.childElementCount) {
+    const empty = document.createElement("span");
+    empty.className = "profile-no-title";
+    empty.textContent = "현재 표시 중인 칭호가 없습니다.";
+    badges.append(empty);
+  }
+  $("#developerTitleControl").classList.toggle("hidden", !isDeveloperAccount());
+  $("#profileTitleSelect").value = isDeveloperAccount() ? game.title : "";
+  $("#profileTitleHint").textContent = isDeveloperAccount()
+    ? "‘개발자’는 이 계정에서 설정할 수 있고, ‘익절왕’은 현재 랭킹 1위에게 자동으로 표시됩니다."
+    : "‘개발자’는 지정된 계정만 설정할 수 있습니다. ‘익절왕’은 현재 랭킹 1위에게 자동 표시되고 순위가 바뀌면 함께 이동합니다.";
 }
 
 function setMessage(message, kind = "") {
@@ -255,12 +289,15 @@ onAuthStateChanged(auth, async (user) => {
   $("#heroSignInButton").classList.toggle("hidden", Boolean(user));
   $("#signOutButton").classList.toggle("hidden", !user);
   $("#rankingTab").classList.toggle("hidden", !user);
+  $("#profileTab").classList.toggle("hidden", !user);
   $("#userBadge").classList.toggle("hidden", !user);
-  if (!user) { $("#userBadge").textContent = ""; showView("authView"); return; }
+  if (!user) { game.title = ""; game.isCurrentLeader = false; $("#userBadge").textContent = ""; showView("authView"); return; }
   $("#userBadge").textContent = user.displayName || user.email;
   try {
     const profile = await getDoc(doc(db, "players", user.uid));
-    const nickname = profile.exists() ? profile.data().nickname : "";
+    const profileData = profile.exists() ? profile.data() : {};
+    const nickname = profileData.nickname || "";
+    game.title = isDeveloperAccount() && profileData.title === "개발자" ? "개발자" : "";
     if (nickname) { game.nickname = nickname; $("#userBadge").textContent = nickname; showView("gameView"); render(); }
     else { $("#nicknameError").textContent = ""; $("#nicknameInput").value = ""; $("#nicknameDialog").showModal(); }
   } catch (error) {
@@ -274,36 +311,89 @@ async function submitNickname(event) {
   if ([...nickname].length < 2 || [...nickname].length > 12) { $("#nicknameError").textContent = "닉네임은 2~12자로 입력해 주세요."; return; }
   const button = $("#nicknameForm button"); button.disabled = true;
   try {
-    await setDoc(doc(db,"players",game.currentUser.uid), {nickname, email:game.currentUser.email || ""});
+    await setDoc(doc(db,"players",game.currentUser.uid), {nickname, email:game.currentUser.email || "", title:game.title});
     game.nickname = nickname; $("#userBadge").textContent = nickname; $("#nicknameDialog").close(); showView("gameView"); render();
   } catch (error) { $("#nicknameError").textContent = error.message; }
   finally { button.disabled = false; }
 }
 
+async function openProfile() {
+  showView("profileView");
+  if (profileLeaderUnsubscribe) profileLeaderUnsubscribe();
+  profileLeaderUnsubscribe = null;
+  game.isCurrentLeader = false;
+  $("#profileStatus").textContent = "";
+  $("#profileError").textContent = "";
+  $("#profileEmail").textContent = game.currentUser?.email || "Google 계정";
+  $("#profileNicknameInput").value = game.nickname;
+  renderProfileTitles();
+  const leaderQuery = query(collection(db,"rankings"),orderBy("score","desc"),limit(1));
+  profileLeaderUnsubscribe = onSnapshot(leaderQuery, (snapshot) => {
+    game.isCurrentLeader = !snapshot.empty && snapshot.docs[0].id === game.currentUser?.uid;
+    renderProfileTitles();
+  }, (error) => { $("#profileError").textContent = `칭호 정보를 불러오지 못했습니다. ${error.message}`; });
+}
+
+async function saveProfile(event) {
+  event.preventDefault();
+  const nickname = $("#profileNicknameInput").value.trim();
+  if ([...nickname].length < 2 || [...nickname].length > 12) {
+    $("#profileError").textContent = "닉네임은 2~12자로 입력해 주세요.";
+    return;
+  }
+  const title = isDeveloperAccount() && $("#profileTitleSelect").value === "개발자" ? "개발자" : "";
+  const button = $("#saveProfileButton");
+  button.disabled = true;
+  $("#profileStatus").textContent = "저장 중…";
+  $("#profileError").textContent = "";
+  try {
+    const profileRef = doc(db,"players",game.currentUser.uid);
+    const rankingRef = doc(db,"rankings",game.currentUser.uid);
+    const ranking = await getDoc(rankingRef);
+    const batch = writeBatch(db);
+    batch.set(profileRef,{nickname,email:game.currentUser.email || "",title},{merge:true});
+    if (ranking.exists()) batch.update(rankingRef,{nickname,title});
+    await batch.commit();
+    game.nickname = nickname;
+    game.title = title;
+    $("#userBadge").textContent = nickname;
+    $("#profileStatus").textContent = "개인정보를 저장했습니다.";
+    renderProfileTitles();
+  } catch (error) {
+    $("#profileStatus").textContent = "";
+    $("#profileError").textContent = `저장하지 못했습니다. ${error.message}`;
+  } finally { button.disabled = false; }
+}
+
 async function openRanking() {
   showView("rankingView"); $("#rankingRows").replaceChildren(); $("#rankingStatus").textContent = "랭킹을 불러오는 중…";
-  try {
-    const rankingQuery = query(collection(db,"rankings"),orderBy("score","desc"),limit(20));
-    const snapshot = await getDocs(rankingQuery);
+  if (rankingUnsubscribe) rankingUnsubscribe();
+  const rankingQuery = query(collection(db,"rankings"),orderBy("score","desc"),limit(20));
+  rankingUnsubscribe = onSnapshot(rankingQuery, (snapshot) => {
+    $("#rankingRows").replaceChildren();
     if (snapshot.empty) { $("#rankingStatus").textContent = "아직 등록된 기록이 없습니다."; return; }
     $("#rankingStatus").textContent = "점수는 보유 현금 기준입니다. 기록 시각은 한국 표준시로 표시합니다.";
     snapshot.docs.forEach((item,index) => {
       const data=item.data(), row=document.createElement("tr");
       if (item.id === game.currentUser.uid) row.classList.add("own-row");
       const rank=document.createElement("td");rank.textContent=`${index+1}위`;
-      const nickname=document.createElement("td");nickname.textContent=data.nickname || "익명";
+      const nickname=document.createElement("td"), name=document.createElement("span"), badges=document.createElement("span");
+      name.textContent=data.nickname || "익명"; badges.className="title-badges ranking-title-badges";
+      if (data.title === "개발자") addTitleBadge(badges,"개발자");
+      if (index === 0) addTitleBadge(badges,"익절왕");
+      nickname.append(name,badges);
       const score=document.createElement("td");score.textContent=won(data.score || 0);
       const stamp=document.createElement("td");stamp.textContent=data.updatedAt?.toDate ? formatLocalDate(data.updatedAt.toDate()) : "-";
       row.append(rank,nickname,score,stamp); $("#rankingRows").append(row);
     });
-  } catch (error) { $("#rankingStatus").textContent = `랭킹을 불러오지 못했습니다. Firestore 규칙과 설정을 확인해 주세요. ${error.message}`; }
+  }, (error) => { $("#rankingStatus").textContent = `랭킹을 불러오지 못했습니다. Firestore 규칙과 설정을 확인해 주세요. ${error.message}`; });
 }
 
 async function saveRanking() {
   const button = $("#confirmSaveButton"); button.disabled = true; $("#saveError").textContent = "";
   try {
     await setDoc(doc(db,"rankings",game.currentUser.uid), {
-      nickname:game.nickname, score:Math.trunc(game.bestScore), updatedAt:serverTimestamp()
+      nickname:game.nickname, score:Math.trunc(game.bestScore), updatedAt:serverTimestamp(), title:game.title
     });
     $("#confirmDialog").close(); resetGame(); showView("gameView");
   } catch (error) { $("#saveError").textContent = `저장하지 못했습니다. ${error.message}`; }
@@ -316,6 +406,9 @@ $("#signOutButton").addEventListener("click", () => signOut(auth));
 $("#nicknameForm").addEventListener("submit", submitNickname);
 $("#rankingTab").addEventListener("click", openRanking);
 $("#backToGameButton").addEventListener("click", () => showView("gameView"));
+$("#profileTab").addEventListener("click", openProfile);
+$("#profileBackButton").addEventListener("click", () => showView("gameView"));
+$("#profileForm").addEventListener("submit", saveProfile);
 $("#buyButton").addEventListener("click", () => trade(true));
 $("#sellButton").addEventListener("click", () => trade(false));
 $("#minusButton").addEventListener("click", () => { $("#quantityInput").value = Math.max(1,(Number($("#quantityInput").value)||1)-1); });
